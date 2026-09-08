@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Database & runtime data
+data/
+*.db
+*.sqlite3
+*.log
+
+# Environment & credentials
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# VPS & scratch scripts containing server credentials
+*proxy*.py
+*vps*.py
+find_*.py
+test_yahoo_smtp.py
+sync_skills_to_vps.py
+inspect_live_listings.py
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
