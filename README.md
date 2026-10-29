@@ -1,119 +1,85 @@
 # Hermes Autonomous Rental Monitoring System
 
-An autonomous monitoring agent designed to discover, track, evaluate, deduplicate, and notify about accommodation opportunities for students studying at **Istanbul Aydın University (IAU)** in Istanbul, Turkey.
-
----
-
-## Architecture & Workflow
+Continuously watches live Emlakjet listings around **Istanbul Aydın University** (Florya / Beşyol
+campus), scores each one for a student tenant, tracks price changes and removals, and alerts via
+**Telegram** (and optionally email).
 
 ```text
-SEARCH -> EXTRACT -> NORMALIZE -> SCORE -> DEDUPLICATE -> DATABASE -> NOTIFICATION (Telegram/Email)
+FEEDS (6 neighbourhoods + watchlist) -> VERIFY listing page -> FILTER -> SCORE -> SQLite -> ALERT
 ```
 
-1. **Continuous 20-minute cycle:** Rotates targeted Turkish search queries across Turkish real-estate portals, student residences, male student dorms, and Airbnb/Booking monthly stays.
-2. **Effective Cost Normalization:** Converts daily/weekly/monthly rates into true effective monthly costs inclusive of mandatory cleaning fees, utilities, and monthly discount structures.
-3. **Transit Distance Estimator:** Computes walking and commute minutes to Istanbul Aydın University (Beşyol/Florya campus) and nearest Metrobus stations.
-4. **100-Point Scoring Engine:** Multi-factor scoring prioritizing budget ($\le$ 36,000 TL), proximity, furnishing, and reliability.
-5. **Entity Resolution & Deduplication:** Multi-signal fuzzy matching prevents duplicate notifications and maintains canonical records.
-6. **Instant Alerts:** Dual Telegram and Email alerts for $\ge 85$ score opportunities and significant price drops.
+- **Real data only.** Listings come from Emlakjet's own structured data (schema.org JSON-LD) on
+  neighbourhood search pages and listing pages. Every stored listing was verified online.
+- **Efficient & polite.** A listing page is fetched only when it is new, its price changed, or it
+  hasn't been verified for `REVERIFY_HOURS`. Requests are spaced and retried on 429/5xx.
+- **Change detection.** New listings, price drops/increases, removals (404/410/expired/OutOfStock)
+  and reactivations are recorded with full price history.
+- **No duplicate alerts.** Each alert is sent once per listing (price drops once per new price).
+  Failed deliveries are retried on the next cycle.
+- **True monthly cost.** Price scoring uses rent + aidat (building fee).
+- **Student filters.** Rejects family-only, "no students", "no single tenants" and female-only
+  listings (Turkish text is matched case-insensitively, including `İ`).
 
----
+## Setup
 
-## Directory Structure
+```bash
+uv venv .venv
+uv pip install -p .venv -r requirements-dev.txt   # or: pip install -r requirements-dev.txt
+cp .env.example .env                              # then fill in Telegram / SMTP
+```
+
+All settings are documented in [.env.example](.env.example). Without Telegram configured, alerts
+are printed to the console instead.
+
+## Usage
+
+| Command | What it does |
+|---|---|
+| `python main.py check` | Validate configuration and Emlakjet connectivity |
+| `python main.py run-once` | One cycle, then show the dashboard (`run_single_search.bat`) |
+| `python main.py monitor [--interval N]` | Cycle every N minutes + daily digest (`start_monitor.bat`) |
+| `python main.py dashboard [--min-score N]` | Statistics and top listings |
+| `python main.py summary [--send]` | Daily digest; `--send` delivers it via Telegram/email |
+| `python main.py test` | Run the test suite (`pytest`) |
+
+Add listing URLs you want tracked regardless of the feeds to [watchlist.txt](watchlist.txt).
+
+## Alert rules
+
+| Event | Condition | Channels |
+|---|---|---|
+| New / reactivated listing | score ≥ `SCORE_INSTANT_ALERT` (75), or over-budget but otherwise strong | Telegram |
+| … high score | score ≥ `SCORE_MULTI_CHANNEL_ALERT` (85) | Telegram + email |
+| Price drop | score ≥ `SCORE_DAILY_DIGEST` (65) | Telegram + email |
+| Daily digest | every day at `DAILY_DIGEST_HOUR` | Telegram + email |
+| Health warning | all feeds failed 3 cycles in a row | Telegram |
+
+Scoring details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
+## Project layout
 
 ```text
-RentAprt/
-├── .env.example
-├── .gitignore
-├── requirements.txt
-├── README.md
-├── main.py
-│
-├── docs/
-│   ├── SPECIFICATION.md
-│   ├── USER_PROMPT_AR.md
-│   └── ARCHITECTURE.md
-│
-├── skills/
-│   └── rental-monitor/
-│       ├── SKILL.md
-│       ├── search/SKILL.md
-│       ├── extraction/SKILL.md
-│       ├── scoring/SKILL.md
-│       ├── deduplication/SKILL.md
-│       ├── notification/SKILL.md
-│       └── scheduler/SKILL.md
-│
-├── src/
-│   ├── config.py
-│   ├── db/
-│   │   ├── models.py
-│   │   └── database.py
-│   ├── search/
-│   │   ├── engine.py
-│   │   └── sources/
-│   ├── extraction/
-│   │   ├── normalizer.py
-│   │   └── distance.py
-│   ├── scoring/
-│   │   └── scorer.py
-│   ├── deduplication/
-│   │   └── matcher.py
-│   ├── notification/
-│   │   ├── telegram.py
-│   │   ├── email_service.py
-│   │   └── dispatcher.py
-│   ├── scheduler/
-│   │   └── runner.py
-│   └── dashboard/
-│       └── app.py
-│
-└── data/
-    └── rentals.db
+main.py              CLI entry point (run_cycle.py is a compatibility wrapper)
+watchlist.txt        Extra listing URLs to track
+src/config.py        Settings from .env (feeds, budget, thresholds, credentials)
+src/scraper.py       Emlakjet feed + listing parsing, HTTP with retries
+src/scoring.py       Normalisation, eligibility filters, 0–100 score
+src/geo.py           Neighbourhood centroids, walking times to campus / Metrobüs
+src/database.py      SQLite: listings, price history, alert log, cycle runs
+src/notifier.py      Telegram / email delivery and message formatting
+src/pipeline.py      The monitoring cycle and daily digest
+src/scheduler.py     APScheduler loop (python -m src.scheduler)
+src/dashboard.py     Terminal output
+tests/               pytest suite (offline; real-page fixtures in tests/fixtures)
+hermes/skills/       Hermes agent skill descriptions
 ```
 
----
+## Limitations
 
-## Installation & Setup
-
-1. **Install Python dependencies:**
-   ```bash
-   pip install -r requirements.txt
-   # or with uv:
-   uv pip install -r requirements.txt
-   ```
-
-2. **Configure Environment:**
-   ```bash
-   cp .env.example .env
-   ```
-   Edit `.env` to configure your Telegram Bot Token and SMTP Email credentials.
-
----
-
-## Usage Commands
-
-- **Run a single search & update cycle:**
-  ```bash
-  python main.py run-once
-  ```
-
-- **Start continuous 20-minute background monitoring:**
-  ```bash
-  python main.py monitor
-  ```
-
-- **Display live terminal dashboard:**
-  ```bash
-  python main.py dashboard
-  ```
-
-- **Generate daily market summary report:**
-  ```bash
-  python main.py summary
-  ```
-
-- **Run end-to-end self test:**
-  ```bash
-  python main.py test
-  ```
+- Emlakjet does not publish coordinates; walking times use approximate neighbourhood centroids
+  (`src/geo.py`). Neighbourhoods not in that table are shown as "location unknown" and get a
+  neutral location score — add them to `NEIGHBORHOOD_COORDS` to improve accuracy.
+- Only Emlakjet is scraped. Sahibinden, Hepsiemlak and Airbnb block or require JavaScript and are
+  not supported.
+- If Emlakjet changes its page structure, `python main.py check` and the fixture tests in
+  `tests/test_parsing.py` are the first things to run.

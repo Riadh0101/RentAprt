@@ -1,0 +1,3 @@
+# Emlakjet listing URLs to track even when they drop out of the neighbourhood feeds.
+# One URL per line; text after '#' is ignored.
+https://www.emlakjet.com/ilan/metrobus-duragi-ve-aydin-universitesi-yani-esyali-ve-faturalar-dahil-10-kiralik-daire-19797604
