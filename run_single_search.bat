@@ -4,5 +4,5 @@ echo ========================================================
 echo   HERMES RENTAL MONITOR - تشغيل دورة بحث فورية
 echo ========================================================
 cd /d "%~dp0"
-.venv\Scripts\python.exe run_cycle.py --notify
+.venv\Scripts\python.exe main.py run-once
 pause

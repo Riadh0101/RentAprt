@@ -1,181 +1,202 @@
+"""Telegram and email delivery plus message formatting (Arabic, matching the user's alerts)."""
 import html
 import logging
-from typing import Dict, Any, Optional
-import httpx
-from src.config import (
-    TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID,
-    SMTP_SERVER, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, ALERT_RECIPIENT_EMAIL
-)
-from datetime import datetime
-from src.database import record_notification
-
-logger = logging.getLogger("HermesNotifier")
-
-def format_telegram_alert(prop: Dict[str, Any], alert_type: str = "NEW_MATCH") -> str:
-    """Format property details into a clean Telegram HTML message."""
-    send_time = datetime.now().strftime("%Y-%m-%d | %H:%M:%S")
-    time_banner = f"⏱️ <b>تاريخ وتوقيت الإرسال:</b> <code>{send_time}</code>\n"
-
-    score = prop.get("score", 0)
-    classification = prop.get("classification", "MATCH")
-    title = html.escape(prop.get("title", "Apartment Listing"))
-    location = html.escape(prop.get("location", "Istanbul"))
-    rooms = html.escape(prop.get("rooms", "1+1"))
-    furnished_txt = "نعم (Furnished / Eşyalı)" if prop.get("furnished") == 1 else "جزئي" if prop.get("furnished") == 2 else "لا"
-    price = f"{float(prop.get('price_tl', 0.0)):,.0f}"
-    area = prop.get("area_m2") or "N/A"
-    univ_mins = prop.get("univ_dist_min", "?")
-    metro_mins = prop.get("metrobus_dist_min", "?")
-    contact = html.escape(str(prop.get("contact_info") or "متوفر في الإعلان"))
-    url = prop.get("url", "#")
-    source = html.escape(prop.get("source", "Web"))
-
-    listing_date = html.escape(str(prop.get("listing_date") or "اليوم / حديث"))
-
-    if alert_type == "PRICE_DROP":
-        old_p = f"{float(prop.get('old_price', 0.0)):,.0f}"
-        drop_pct = prop.get("price_drop_pct", 0)
-        header = f"🏷️ <b>AG Alert — انخفاض في السعر!</b>\n\n"
-        price_block = f"📉 <b>السعر القديم:</b> <s>{old_p} TL</s>\n🔥 <b>السعر الجديد:</b> <b>{price} TL</b> (خصم {drop_pct}%)\n"
-    elif classification == "OVER_BUDGET_EXCEPTIONAL":
-        header = f"💎 <b>AG Alert — عرض استثنائي (يتجاوز الميزانية قليلاً)</b>\n\n"
-        price_block = f"💰 <b>الإيجار الشهري:</b> <b>{price} TL</b> (يتجاوز 36k ولكن الموقع/الجودة ممتازة)\n"
-    else:
-        header = f"🏠 <b>AG Alert — شقة مطابقة جديدة</b>\n\n"
-        price_block = f"💰 <b>الإيجار الشهري:</b> <b>{price} TL</b>\n"
-
-    msg = (
-        f"{time_banner}"
-        f"{header}"
-        f"⭐ <b>التقييم:</b> <code>{score}/100</code> — <b>[{classification}]</b>\n\n"
-        f"📍 <b>المنطقة:</b> {location}\n"
-        f"🏢 <b>النوع:</b> {rooms} | <b>المساحة:</b> {area} م²\n"
-        f"🛋️ <b>مفروشة:</b> {furnished_txt}\n"
-        f"{price_block}"
-        f"🎓 <b>جامعة أيدن:</b> <b>{univ_mins} دقائق مشياً</b>\n"
-        f"🚇 <b>محطة المتروباص:</b> <b>{metro_mins} دقائق مشياً</b>\n"
-        f"📅 <b>تاريخ نشر/تحديث الإعلان:</b> <code>{listing_date}</code>\n"
-        f"📞 <b>بيانات التواصل:</b> {contact}\n"
-        f"🔗 <b>رابط الإعلان المباشر (اضغط للفتح فوراً):</b>\n{url}"
-    )
-    return msg
-
-def send_telegram_message(message_html: str) -> bool:
-    """Send message via Telegram Bot API."""
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        logger.info("[Telegram Disabled] TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID not configured in .env.")
-        print("\n" + "="*50)
-        print("📢 [TELEGRAM PREVIEW - NOT CONFIGURED IN .env]:")
-        # Strip simple tags for console output
-        plain = message_html.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "")
-        print(plain)
-        print("="*50 + "\n")
-        return False
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message_html,
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False
-    }
-
-    try:
-        with httpx.Client(timeout=10.0) as client:
-            resp = client.post(url, json=payload)
-            if resp.status_code == 200:
-                logger.info("Telegram alert dispatched successfully.")
-                return True
-            else:
-                logger.error(f"Telegram API failed with code {resp.status_code}: {resp.text}")
-                return False
-    except Exception as e:
-        logger.error(f"Error dispatching Telegram message: {e}")
-        return False
-
+import re
 import smtplib
-from email.mime.text import MIMEText
+from datetime import datetime
 from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from typing import Callable, Dict, Optional, Sequence, Tuple
 
-def send_email_report(properties: list, recipient_email: str = None) -> bool:
-    """Send a formatted HTML email report of properties to recipient."""
-    recipient = recipient_email or ALERT_RECIPIENT_EMAIL or "Riadh0101@yahoo.fr"
-    if not recipient:
-        logger.warning("No email recipient configured.")
-        return False
+import httpx
 
-    if not SMTP_USERNAME or not SMTP_PASSWORD:
-        logger.info(f"[Email Queued] SMTP_USERNAME or SMTP_PASSWORD not set in .env. Email to {recipient} requires an App Password.")
-        return False
+from .config import Settings
+from .models import FURNISHED, PARTIAL, Listing
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    subject = f"🏠 Her Alert — تقرير نتائج البحث الجديد ({now_str})"
+logger = logging.getLogger(__name__)
 
-    # Build HTML email
-    items_html = ""
-    for idx, prop in enumerate(properties, 1):
-        price = f"{float(prop.get('price_tl', 0)):,.0f} TL"
-        items_html += f"""
-        <div style="border: 1px solid #e0e0e0; border-radius: 8px; padding: 15px; margin-bottom: 15px; background: #ffffff;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
-                <span style="font-size: 16px; font-weight: bold; color: #1a73e8;">#{idx}. {html.escape(prop.get('title', ''))}</span>
-                <span style="background: #e6f4ea; color: #137333; font-weight: bold; padding: 4px 10px; border-radius: 12px;">{prop.get('score')}/100 - {prop.get('classification')}</span>
-            </div>
-            <p style="margin: 4px 0; color: #555;">📍 <b>المنطقة:</b> {html.escape(prop.get('location', ''))} | 🏢 <b>النوع:</b> {prop.get('rooms')} | 🛋️ <b>مفروشة:</b> {'نعم' if prop.get('furnished') == 1 else 'لا'}</p>
-            <p style="margin: 4px 0; color: #555;">📅 <b>تاريخ نشر/تحديث الإعلان:</b> <b>{html.escape(str(prop.get('listing_date') or 'اليوم / حديث'))}</b></p>
-            <p style="margin: 4px 0; font-size: 16px; color: #d93025;">💰 <b>الإيجار الشهري:</b> <b>{price}</b></p>
-            <p style="margin: 4px 0; color: #333;">🎓 <b>جامعة أيدن:</b> {prop.get('univ_dist_min')} دقيقة مشياً | 🚇 <b>المتروباص:</b> {prop.get('metrobus_dist_min')} دقيقة</p>
-            <p style="margin: 4px 0; color: #666;">📞 <b>بيانات التواصل:</b> {html.escape(str(prop.get('contact_info') or 'متوفر في الإعلان'))}</p>
-            <div style="margin-top: 10px;">
-                <a href="{prop.get('url', '#')}" style="background: #1a73e8; color: #ffffff; padding: 8px 16px; text-decoration: none; border-radius: 4px; display: inline-block; font-weight: bold;">فتح رابط الإعلان الأصلي 🔗</a>
-            </div>
-        </div>
-        """
+NEW_MATCH, PRICE_DROP, REACTIVATED = "NEW_MATCH", "PRICE_DROP", "REACTIVATED"
+TELEGRAM_LIMIT = 4096
 
-    full_html = f"""
-    <div dir="rtl" style="font-family: Arial, Tahoma, sans-serif; background-color: #f8f9fa; padding: 20px; color: #333;">
-        <div style="max-width: 650px; margin: 0 auto; background: #ffffff; padding: 25px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.05);">
-            <div style="border-bottom: 2px solid #1a73e8; padding-bottom: 12px; margin-bottom: 20px;">
-                <h2 style="color: #1a73e8; margin: 0 0 6px 0;">🏠 AG Alert — نتائج البحث</h2>
-                <p style="margin: 0; color: #666; font-size: 14px;">⏱️ <b>تاريخ وتوقيت الإرسال:</b> {now_str}</p>
-            </div>
-            <p style="font-size: 15px;">تم إجراء فحص شامل وجديد لسوق عقارات الطلاب في إسطنبول بمحيط <b>جامعة إسطنبول أيدن</b> وخط المتروباص، وهذه هي أفضل العروض المؤهلة المطابقة لشروطك:</p>
-            {items_html}
-            <div style="border-top: 1px solid #eee; padding-top: 15px; margin-top: 25px; font-size: 12px; color: #888; text-align: center;">
-                نظام HERMES للمراقبة المستمرة — تم الإرسال آلياً إلى {recipient}
-            </div>
-        </div>
-    </div>
-    """
+_HEADERS = {
+    NEW_MATCH: "🏠 <b>Hermes — شقة مطابقة جديدة</b>",
+    PRICE_DROP: "🏷️ <b>Hermes — انخفاض في السعر!</b>",
+    REACTIVATED: "♻️ <b>Hermes — إعلان عاد للنشر</b>",
+}
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = SMTP_USERNAME
-    msg["To"] = recipient
-    msg.attach(MIMEText(full_html, "html", "utf-8"))
+Result = Tuple[bool, str]
 
-    try:
-        if SMTP_PORT == 465:
-            server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=15)
-        else:
-            server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=15)
-            server.starttls()
-        server.login(SMTP_USERNAME, SMTP_PASSWORD)
-        server.sendmail(SMTP_USERNAME, [recipient], msg.as_string())
-        server.quit()
-        logger.info(f"Email report successfully sent to {recipient}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to send email to {recipient}: {e}")
-        return False
 
-def dispatch_alert(prop: Dict[str, Any], alert_type: str = "NEW_MATCH") -> bool:
-    """Dispatch alert via Telegram and record in database."""
-    msg = format_telegram_alert(prop, alert_type)
-    success = send_telegram_message(msg)
-    
-    prop_id = prop.get("id")
-    if prop_id:
-        record_notification(prop_id, channel="telegram", alert_type=alert_type)
-    
-    return success
+def _e(value) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def _money(value: Optional[float]) -> str:
+    return f"{value:,.0f} TL" if value is not None else "—"
+
+
+def _furnished_text(code: Optional[int]) -> str:
+    return {FURNISHED: "نعم (Eşyalı)", PARTIAL: "جزئي (Yarı eşyalı)"}.get(code, "لا / غير محدد")
+
+
+def _minutes(value: Optional[int]) -> str:
+    return f"≈{value} دقيقة مشياً" if value is not None else "غير معروف"
+
+
+def format_alert(listing: Listing, alert_type: str, old_price: Optional[float] = None) -> str:
+    header = _HEADERS.get(alert_type, _HEADERS[NEW_MATCH])
+    if listing.classification == "OVER_BUDGET_EXCEPTIONAL" and alert_type == NEW_MATCH:
+        header = "💎 <b>Hermes — عرض استثنائي (يتجاوز الميزانية قليلاً)</b>"
+
+    if alert_type == PRICE_DROP and old_price:
+        pct = (old_price - listing.price) / old_price * 100
+        price_block = (f"📉 <b>السعر القديم:</b> <s>{_money(old_price)}</s>\n"
+                       f"🔥 <b>السعر الجديد:</b> <b>{_money(listing.price)}</b> (−{pct:.1f}%)\n")
+    else:
+        price_block = f"💰 <b>الإيجار الشهري:</b> <b>{_money(listing.price)}</b>\n"
+    if listing.aidat:
+        price_block += f"🧾 <b>العائدات (Aidat):</b> {_money(listing.aidat)} — <b>الإجمالي:</b> {_money(listing.effective_cost)}\n"
+    if listing.bills_included:
+        price_block += "✅ <b>الفواتير مشمولة بالإيجار</b>\n"
+
+    station = f" ({_e(listing.metrobus_station)})" if listing.metrobus_station else ""
+    lines = [
+        f"⏱️ <code>{datetime.now():%Y-%m-%d %H:%M}</code>",
+        header,
+        "",
+        f"⭐ <b>التقييم:</b> <code>{listing.score}/100</code> — <b>[{_e(listing.classification)}]</b>",
+        f"📝 {_e(listing.title)}",
+        f"📍 <b>المنطقة:</b> {_e(listing.location or 'Istanbul')}",
+        f"🏢 <b>النوع:</b> {_e(listing.rooms or '?')} | <b>المساحة:</b> {_e(int(listing.area_m2)) if listing.area_m2 else '?'} م²",
+        f"🛋️ <b>مفروشة:</b> {_furnished_text(listing.furnished)}",
+        price_block.rstrip("\n"),
+        f"💵 <b>التأمين (Depozito):</b> {_money(listing.deposit)}",
+        f"🎓 <b>جامعة أيدن:</b> {_minutes(listing.univ_walk_min)}",
+        f"🚇 <b>المتروباص{station}:</b> {_minutes(listing.metrobus_walk_min)}",
+        f"📅 <b>آخر تحديث للإعلان:</b> <code>{_e(listing.updated_date or listing.listing_date or 'غير محدد')}</code>",
+        "",
+        f'🔗 <a href="{_e(listing.url)}">فتح الإعلان الأصلي</a>',
+    ]
+    return "\n".join(lines)[:TELEGRAM_LIMIT]
+
+
+def format_digest(stats: Dict, top: Sequence[Listing]) -> str:
+    lines = [
+        "📊 <b>Hermes — الملخص اليومي لسوق الإيجار</b>",
+        "",
+        f"• الإعلانات النشطة: <b>{stats['active']}</b> (من أصل {stats['total_tracked']})",
+        f"• جديدة خلال 24 ساعة: <b>{stats['new_recent']}</b>",
+        f"• انخفاضات أسعار خلال 24 ساعة: <b>{stats['price_drops_recent']}</b>",
+        f"• إعلانات أزيلت: {stats['removed']}",
+        f"• متوسط التكلفة الشهرية: {_money(stats['average_cost'])} | الأدنى: {_money(stats['lowest_cost'])}",
+        f"• دورات البحث خلال 24 ساعة: {stats['runs_recent']}",
+        "",
+        "🏆 <b>أفضل العروض حالياً:</b>",
+    ]
+    if not top:
+        lines.append("لا توجد عروض مؤهلة حالياً.")
+    for i, p in enumerate(top, 1):
+        lines.append(
+            f'{i}. <a href="{_e(p.url)}">{_e(p.title[:60])}</a>\n'
+            f"   ⭐ {p.score}/100 | 💰 {_money(p.effective_cost)} | 📍 {_e(p.location)} | "
+            f"🎓 {_minutes(p.univ_walk_min)}"
+        )
+    return "\n".join(lines)[:TELEGRAM_LIMIT]
+
+
+def format_email(items: Sequence[Tuple[Listing, str]]) -> Tuple[str, str]:
+    """(subject, html body) for a batch of alerted listings."""
+    labels = {NEW_MATCH: "جديد", PRICE_DROP: "انخفاض سعر", REACTIVATED: "عاد للنشر"}
+    cards = []
+    for listing, alert_type in items:
+        cards.append(f"""
+        <div style="border:1px solid #e0e0e0;border-radius:8px;padding:14px;margin-bottom:14px;background:#fff">
+          <div style="font-size:16px;font-weight:bold;color:#1a73e8">{_e(listing.title)}</div>
+          <div style="margin:6px 0;color:#137333;font-weight:bold">{listing.score}/100 — {_e(listing.classification)} — {labels.get(alert_type, alert_type)}</div>
+          <p style="margin:4px 0">📍 {_e(listing.location)} | 🏢 {_e(listing.rooms or '?')} | 🛋️ {_furnished_text(listing.furnished)}</p>
+          <p style="margin:4px 0;color:#d93025">💰 {_money(listing.price)} (الإجمالي مع العائدات: {_money(listing.effective_cost)})</p>
+          <p style="margin:4px 0">🎓 {_minutes(listing.univ_walk_min)} | 🚇 {_minutes(listing.metrobus_walk_min)}</p>
+          <a href="{_e(listing.url)}" style="background:#1a73e8;color:#fff;padding:8px 16px;text-decoration:none;border-radius:4px;display:inline-block">فتح الإعلان الأصلي 🔗</a>
+        </div>""")
+    body = f"""<div dir="rtl" style="font-family:Arial,Tahoma,sans-serif;background:#f8f9fa;padding:20px;color:#333">
+      <div style="max-width:650px;margin:0 auto">
+        <h2 style="color:#1a73e8">🏠 Hermes — عروض سكن جديدة قرب جامعة إسطنبول أيدن</h2>
+        <p>⏱️ {datetime.now():%Y-%m-%d %H:%M}</p>
+        {''.join(cards)}
+      </div></div>"""
+    subject = f"🏠 Hermes — {len(items)} عرض سكن جديد ({datetime.now():%Y-%m-%d %H:%M})"
+    return subject, body
+
+
+class TelegramNotifier:
+    def __init__(self, settings: Settings, http: Optional[httpx.Client] = None):
+        self.settings = settings
+        self.http = http
+
+    @property
+    def enabled(self) -> bool:
+        return self.settings.telegram_enabled
+
+    def send(self, text: str) -> Result:
+        if not self.enabled:
+            return False, "telegram not configured"
+        url = f"https://api.telegram.org/bot{self.settings.telegram_bot_token}/sendMessage"
+        payload = {"chat_id": self.settings.telegram_chat_id, "text": text,
+                   "parse_mode": "HTML", "disable_web_page_preview": False}
+        try:
+            if self.http is not None:
+                resp = self.http.post(url, json=payload, timeout=15)
+            else:
+                with httpx.Client(timeout=15) as client:
+                    resp = client.post(url, json=payload)
+        except httpx.HTTPError as e:
+            return False, f"{type(e).__name__}: {e}"
+        if resp.status_code == 200:
+            return True, ""
+        return False, f"HTTP {resp.status_code}: {resp.text[:200]}"
+
+
+class EmailNotifier:
+    def __init__(self, settings: Settings, smtp_factory: Optional[Callable] = None):
+        self.settings = settings
+        self._smtp_factory = smtp_factory
+
+    @property
+    def enabled(self) -> bool:
+        s = self.settings
+        return bool(s.email_enabled and s.smtp_username and s.smtp_password and s.alert_recipient_email)
+
+    def _connect(self):
+        s = self.settings
+        if self._smtp_factory:
+            return self._smtp_factory(s.smtp_server, s.smtp_port)
+        if s.smtp_port == 465:
+            return smtplib.SMTP_SSL(s.smtp_server, s.smtp_port, timeout=20)
+        server = smtplib.SMTP(s.smtp_server, s.smtp_port, timeout=20)
+        server.starttls()
+        return server
+
+    def send(self, subject: str, html_body: str) -> Result:
+        if not self.enabled:
+            return False, "email not configured"
+        s = self.settings
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"] = s.email_from or s.smtp_username
+        msg["To"] = s.alert_recipient_email
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+        try:
+            server = self._connect()
+            try:
+                server.login(s.smtp_username, s.smtp_password)
+                server.sendmail(msg["From"], [s.alert_recipient_email], msg.as_string())
+            finally:
+                server.quit()
+        except (smtplib.SMTPException, OSError) as e:
+            return False, f"{type(e).__name__}: {e}"
+        return True, ""
+
+
+def preview(text: str) -> str:
+    """Plain-text rendering of a Telegram HTML message for the console."""
+    return html.unescape(re.sub(r"<[^>]+>", "", text))

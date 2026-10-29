@@ -1,62 +1,53 @@
-import sys
-import time
+"""Continuous monitoring: a cycle every CYCLE_INTERVAL_MINUTES plus a daily digest.
+
+Run with `python main.py monitor` or `python -m src.scheduler`.
+"""
 import logging
-from datetime import datetime
 
-if sys.platform == "win32":
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-        sys.stderr.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
 from apscheduler.schedulers.blocking import BlockingScheduler
+from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
-from run_cycle import run_single_cycle
-from src.config import CYCLE_INTERVAL_MINUTES
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S"
-)
-logger = logging.getLogger("HermesScheduler")
+from .pipeline import Monitor
 
-def start_continuous_monitoring():
-    """Start persistent monitoring scheduler running every 20 minutes."""
-    print("="*70)
-    print(f"🕒 HERMES AUTONOMOUS SCHEDULER STARTED")
-    print(f"🔁 دورة التكرار: كل {CYCLE_INTERVAL_MINUTES} دقيقة بشكل دائم ومستقل")
-    print(f"🚀 تشغيل الدورة الابتدائية الأولى فوراً...")
-    print("="*70)
+logger = logging.getLogger(__name__)
 
-    cycle_count = 0
 
-    def job_wrapper():
-        nonlocal cycle_count
+def start(monitor: Monitor, interval_minutes: int, digest_hour: int, on_report=None):
+    """Run one cycle immediately, then block running cycles on an interval."""
+
+    def cycle():
         try:
-            run_single_cycle(cycle_count)
-            cycle_count += 1
-        except Exception as e:
-            logger.error(f"Error encountered during monitoring cycle: {e}", exc_info=True)
-            logger.info("Cycle error handled gracefully. Scheduler remains active for next tick.")
+            report = monitor.run_cycle()
+            if on_report:
+                on_report(report)
+        except Exception:
+            logger.exception("Monitoring cycle crashed; the scheduler stays active for the next run")
 
-    # Execute cycle #1 immediately
-    job_wrapper()
+    def digest():
+        try:
+            monitor.daily_digest(send=True)
+        except Exception:
+            logger.exception("Daily digest failed")
 
     scheduler = BlockingScheduler()
-    scheduler.add_job(
-        job_wrapper,
-        trigger=IntervalTrigger(minutes=CYCLE_INTERVAL_MINUTES),
-        id="hermes_rental_cycle",
-        name="Hermes 20-minute rental scan",
-        replace_existing=True
-    )
+    scheduler.add_job(cycle, IntervalTrigger(minutes=interval_minutes), id="cycle",
+                      max_instances=1, coalesce=True)
+    scheduler.add_job(digest, CronTrigger(hour=digest_hour, minute=0), id="digest",
+                      max_instances=1, coalesce=True)
 
+    logger.info("Hermes monitor started: cycle every %d min, daily digest at %02d:00",
+                interval_minutes, digest_hour)
+    cycle()
     try:
-        logger.info(f"Scheduler active. Next cycle scheduled in {CYCLE_INTERVAL_MINUTES} minutes.")
         scheduler.start()
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Hermes Scheduler stopped by user.")
+        logger.info("Hermes monitor stopped.")
+
 
 if __name__ == "__main__":
-    start_continuous_monitoring()
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from main import main
+    main(["monitor"])
